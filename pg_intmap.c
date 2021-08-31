@@ -16,12 +16,23 @@ typedef struct
     uint32 valoff;  /* values offset */
 } IntMapHeader;
 
+void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n);
+static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n);
+
 
 PG_FUNCTION_INFO_V1(intmap_in);
 Datum intmap_in(PG_FUNCTION_ARGS)
 {
-    elog(ERROR, "not implemented");
+    char    *in = PG_GETARG_CSTRING(0);
+    int64_t *keys;
+    int64_t *values;
+    int      n;
+
+    parse_intmap(in, &keys, &values, &n);
+
+    return create_intmap_internal(keys, values, n);
 }
+
 
 PG_FUNCTION_INFO_V1(intmap_out);
 Datum intmap_out(PG_FUNCTION_ARGS)
@@ -56,6 +67,34 @@ Datum intmap_out(PG_FUNCTION_ARGS)
 }
 
 
+static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n)
+{
+    uint8_t    *out;
+    uint8_t    *data;
+
+    /* TODO: estimate size */
+    out = palloc0(VARHDRSZ + 5 + sizeof(uint64_t) * n * 2);
+    data = VARDATA(out);
+
+    /* 
+     * Write header
+     * TODO: add version, values offset, used encodings
+     */
+    data = varint_encode(data, n);
+
+    /* Encode keys */
+    for (uint32_t i = 0; i < n; ++i)
+        data = varint_encode(data, keys[i]);
+
+    /* Encode values */
+    for (uint32_t i = 0; i < n; ++i)
+        data = varint_encode(data, values[i]);
+
+    SET_VARSIZE(out, data - out);
+    return PointerGetDatum(out);
+}
+
+
 PG_FUNCTION_INFO_V1(create_intmap);
 Datum create_intmap(PG_FUNCTION_ARGS)
 {
@@ -63,45 +102,22 @@ Datum create_intmap(PG_FUNCTION_ARGS)
     ArrayType  *values_arr = PG_GETARG_ARRAYTYPE_P(1);
     uint64_t   *keys, *values;
     uint32_t    nkeys, nvalues;
-    bool       *nulls;
-    uint8_t    *out;
-    uint8_t    *data;
+    bool       *null_keys, *null_values;
 
     deconstruct_array(keys_arr, INT8OID, sizeof(int64_t), true, 'd',
-                      &keys, &nulls, &nkeys);
-
-    /* TODO: estimate size */
-    out = palloc0(VARHDRSZ + 5 + sizeof(uint64_t) * nkeys * 2);
-    data = VARDATA(out);
-
-    /* 
-     * Write header
-     * TODO: add version, values offset, used encodings
-     */
-    data = varint_encode(data, nkeys);
-
-    /* Encode keys */
-    for (uint32_t i = 0; i < nkeys; ++i) {
-        if (nulls[i])
-            elog(ERROR, "keys array contains NULL");
-        data = varint_encode(data, keys[i]);
-    }
+                      &keys, &null_keys, &nkeys);
 
     deconstruct_array(values_arr, INT8OID, sizeof(int64_t), true, 'd',
-                      &values, &nulls, &nvalues);
+                      &values, &null_values, &nvalues);
 
     if (nkeys != nvalues)
         elog(ERROR, "the keys array size does not match the values array size");
 
-    /* Encode values */
-    for (uint8_t i = 0; i < nvalues; ++i) {
-        if (nulls[i])
-            elog(ERROR, "values array contains NULL");
-        data = varint_encode(data, values[i]);
-    }
+    for (uint32_t i = 0; i < nkeys; ++i)
+        if (null_keys[i] | null_values[i])
+            elog(ERROR, "input arrays must not contain NULLs");
 
-    SET_VARSIZE(out, data - out);
-    PG_RETURN_POINTER(out);
+    return create_intmap_internal(keys, values, nkeys);
 }
 
 
