@@ -15,6 +15,8 @@ static inline const char* parse_int(const char *c, int64_t *out)
 
     *out = strtol(c, &end, 0);
 
+    if (errno == ERANGE)
+        elog(ERROR, "integer out of range");
     if (c == end)
         elog(ERROR, "invalid integer");
 
