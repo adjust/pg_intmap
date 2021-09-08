@@ -25,8 +25,6 @@ typedef struct
 
 typedef struct
 {
-    int64_t min;
-    int64_t max;
     uint32_t varint_bytes;  /* bytes required to store all values in varint */
     uint32_t bitpack_bytes; /* bytes required to store all values in bitpack */
     uint8_t num_bits;       /* sufficient number of bits per value to encode
@@ -40,32 +38,35 @@ void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n);
 static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n);
 
 
-static void collect_stats(ArrayStats *stats, int64_t *vals, int n)
+static void collect_stats(ArrayStats *stats, int64_t *vals, uint32_t n)
 {
-    /* TODO: account for zigzag encoding */
-
-    int64_t min = PG_INT64_MAX;
-    int64_t max = PG_INT64_MIN;
+    uint64_t max = 0;
     uint64_t varint_bytes = 0;
+    uint64_t mask = 0;
 
-    for (int i = 0; i < n; ++i) {
-        min = min < vals[i] ? min : vals[i];
-        max = max > vals[i] ? max : vals[i];
+    for (uint32_t i = 0; i < n; ++i)
+        mask |= vals[i];
+    stats->use_zigzag = mask & ((uint64_t) 1 << 63);
+
+    for (uint32_t i = 0; i < n; ++i) {
+        /* encode with zigzag if needed */
+        vals[i] = stats->use_zigzag ? zigzag_encode(vals[i]) : (uint64_t) vals[i];
+
+        /* count bytes needed for varing encoding */
         varint_bytes += ((sizeof(int64_t) << 3) - __builtin_clzl(vals[i]) + 7) / 7;
+
+        /* find max */
+        max = max > (uint64_t) vals[i] ? max : (uint64_t) vals[i];
     }
 
     stats->varint_bytes = varint_bytes;
-    stats->num_bits = (sizeof(int64_t) << 3) - __builtin_clzl(max);
+    stats->num_bits = (sizeof(uint64_t) << 3) - __builtin_clzl(max);
 
     /* number of bits / 8 + 1 byte for bits length encoding */
     stats->bitpack_bytes = ((n * stats->num_bits + 7) >> 3) + 1;
 
-    stats->min = min;
-    stats->max = max;
-
     stats->best_encoding = stats->varint_bytes < stats->bitpack_bytes ? \
         ENCODING_VARINT : ENCODING_BITPACK;
-    stats->use_zigzag = min < 0;
 }
 
 
@@ -111,13 +112,12 @@ static inline uint8_t *read_encodings(uint8_t *buf,
     return ++buf;
 }
 
+/*
+ * values are expected to be already zigzaged if needed.
+ */
 static inline uint8_t *encode_array(uint8_t *buf, ArrayStats *stats,
                                     int64_t *vals, uint32_t n)
 {
-    if (stats->use_zigzag)
-        for (uint32_t i = 0; i < n; ++i)
-            vals[i] = (int64_t) zigzag_encode(vals[i]);
-
     switch (stats->best_encoding) {
         case ENCODING_VARINT:
             for (uint32_t i = 0; i < n; ++i)
@@ -160,6 +160,79 @@ static inline uint8_t *decode_array(uint8_t *buf, uint8_t encoding,
             vals[i] = zigzag_decode(vals[i]);
 
     return buf;
+}
+
+typedef struct {
+    uint8_t             encoding;
+    bool                zigzag;
+
+    union {
+        /* varint */
+        struct {
+            uint8_t    *buf;
+        } varint;
+
+        /* bit packing */
+        BitpackIter     bitpack;
+    } u;
+} DecoderIter;
+
+static inline void decoder_iter_init(DecoderIter *it, uint8_t encoding, uint8_t *buf)
+{
+    it->encoding = encoding & 0x7;
+    it->zigzag = encoding & 0x8;
+
+    switch (it->encoding)
+    {
+        case ENCODING_VARINT:
+            it->u.varint.buf = buf;
+            break;
+        case ENCODING_BITPACK:
+            {
+                uint8_t     num_bits;
+
+                buf = read_num_bits(buf, &num_bits);
+                bitpack_iter_init(&it->u.bitpack, buf, num_bits);
+                break;
+            }
+        default:
+            elog(ERROR, "unsupported encoding");
+    }
+}
+
+static inline int64_t decoder_iter_next(DecoderIter *it)
+{
+    int64_t res;
+
+    switch (it->encoding)
+    {
+        case ENCODING_VARINT:
+            it->u.varint.buf = varint_decode(it->u.varint.buf, &res);
+            break;
+        case ENCODING_BITPACK:
+            res = bitpack_iter_next(&it->u.bitpack);
+            break;
+        default:
+            elog(ERROR, "unsupported encoding");
+    }
+
+    if (it->zigzag)
+        res = zigzag_decode(res);
+
+    return res;
+}
+
+static inline uint8_t *decoder_iter_finish(DecoderIter *it)
+{
+    switch (it->encoding)
+    {
+        case ENCODING_VARINT:
+            return it->u.varint.buf;
+        case ENCODING_BITPACK:
+            return bitpack_iter_finish(&it->u.bitpack);
+        default:
+            elog(ERROR, "unsupported encoding");
+    }
 }
 
 PG_FUNCTION_INFO_V1(intmap_out);
@@ -258,31 +331,69 @@ Datum intmap_get_val(PG_FUNCTION_ARGS)
     uint8_t *data = VARDATA(in);
     int32_t  found_idx = -1;
     uint64_t n;
+    uint8_t  keys_enc, vals_enc;
+    DecoderIter it;
 
-    /* read the number of items */
+    /* read the number of items and the encodings */
     data = varint_decode(data, &n);
+    data = read_encodings(data, &keys_enc, &vals_enc);
 
     /* read keys */
-    for (uint32_t i = 0; i < n; ++i)
-    {
-        uint64_t cur_key;
-
-        data = varint_decode(data, &cur_key);
-        if (cur_key == key) {
+    decoder_iter_init(&it, keys_enc, data);
+    for (int i = 0; i < n; ++i)
+        if (decoder_iter_next(&it) == key)
             found_idx = i;
-        }
-    }
+    data = decoder_iter_finish(&it);
 
+    /* read values */
     if (found_idx >= 0) {
-        uint64_t res;
+        int64_t res;
 
-        /* read values */
-        for (int32_t i = 0; i <= found_idx; ++i)
-            data = varint_decode(data, &res);
+        decoder_iter_init(&it, vals_enc, data);
+        for (int i = 0; i <= found_idx; ++i)
+            res = decoder_iter_next(&it);
 
         PG_RETURN_UINT64(res);
     }
 
     /* key's not found */
     PG_RETURN_NULL();
+}
+
+static inline const char *encoding_to_str(uint8_t encoding)
+{
+    switch (encoding) {
+        case ENCODING_VARINT:
+            return "varint";
+        case ENCODING_BITPACK:
+            return "bit-pack";
+        case ENCODING_VARINT | ENCODING_ZIGZAG:
+            return "varint (zig-zag)";
+        case ENCODING_BITPACK | ENCODING_ZIGZAG:
+            return "bit-pack (zig-zag)";
+        default:
+            elog(ERROR, "unexpected encoding");
+    }
+}
+
+PG_FUNCTION_INFO_V1(intmap_meta);
+Datum intmap_meta(PG_FUNCTION_ARGS)
+{
+    Datum in = PointerGetDatum(PG_DETOAST_DATUM(PG_GETARG_DATUM(0)));
+    uint8_t *data = VARDATA(in);
+    uint64_t n;
+    uint8_t keys_encoding, vals_encoding;
+    StringInfoData str;
+
+    /* read the number of items and encodings */
+    data = varint_decode(data, &n);
+    data = read_encodings(data, &keys_encoding, &vals_encoding);
+
+    initStringInfo(&str);
+    appendStringInfo(&str, "count: %u, keys encoding: %s, values encoding: %s",
+                     n,
+                     encoding_to_str(keys_encoding),
+                     encoding_to_str(vals_encoding));
+
+    PG_RETURN_CSTRING(str.data);
 }

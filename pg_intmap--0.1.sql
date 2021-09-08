@@ -29,3 +29,8 @@ CREATE OPERATOR -> (
     rightarg  = int8,
     procedure = intmap_get_val
 );
+
+CREATE FUNCTION intmap_meta(intmap)
+RETURNS cstring
+AS 'pg_intmap'
+LANGUAGE C IMMUTABLE STRICT;

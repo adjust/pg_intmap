@@ -111,6 +111,50 @@ const uint8_t *bitpack_decode(const uint8_t *buf, uint64_t *out, uint32_t nvals,
     return buf + bytes_read;
 }
 
+void bitpack_iter_init(BitpackIter *it, uint8_t *buf, uint8_t num_bits)
+{
+    it->buf = buf;
+    it->mask = ~((uint64_t)-1 << num_bits);
+    it->num_bits = num_bits;
+    it->bits_read = 0;
+    memcpy(&it->reg, buf, sizeof(uint64_t));
+}
+
+uint8_t *bitpack_iter_finish(BitpackIter *it)
+{
+    /*
+     * how many bytes are read:
+     * (bits + sizeof(uint8_t) - 1) / sizeof(uint8_t)
+     */
+    uint8_t bytes_read = (it->bits_read + 7) >> 3;
+
+    return it->buf + bytes_read;
+
+}
+
+uint64_t bitpack_iter_next(BitpackIter *it)
+{
+    uint64_t out;
+
+    out = it->reg & it->mask;
+    it->bits_read += it->num_bits;
+
+    if (it->bits_read > INT64_BITSIZE) {
+        uint8_t diff = it->bits_read - INT64_BITSIZE;
+        uint8_t shift = it->num_bits - diff;
+
+        it->buf += sizeof(uint64_t);
+        memcpy(&it->reg, it->buf, sizeof(uint64_t));
+
+        out |= (it->reg & (it->mask >> shift)) << shift;
+        it->reg >>= shift;
+        it->bits_read = diff;
+    }
+    it->reg >>= it->num_bits;
+
+    return out;
+}
+
 uint64_t zigzag_encode(int64_t value)
 {
     return (value << 1) ^ (value >> (INT64_BITSIZE - 1));
