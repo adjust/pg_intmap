@@ -1,0 +1,49 @@
+create extension pg_intmap;
+select intmap_meta('85469345=>3, 2=>153, 3=>123');
+                        intmap_meta                         
+------------------------------------------------------------
+ count: 3, keys encoding: varint, values encoding: bit-pack
+(1 row)
+
+select intmap_meta('-85469345=>3, 2=>153, 3=>-123');
+                                  intmap_meta                                   
+--------------------------------------------------------------------------------
+ count: 3, keys encoding: varint (zig-zag), values encoding: bit-pack (zig-zag)
+(1 row)
+
+select '85469345=>3, 2=>153, 3=>123';
+          ?column?           
+-----------------------------
+ 85469345=>3, 2=>153, 3=>123
+(1 row)
+
+select '-85469345=>3, 2=>153, 3=>123';
+           ?column?           
+------------------------------
+ -85469345=>3, 2=>153, 3=>123
+(1 row)
+
+select '9223372036854775807=>1'::intmap;
+         intmap         
+------------------------
+ 9223372036854775807=>1
+(1 row)
+
+select '9223372036854775808=>1'::intmap;
+ERROR:  integer out of range
+LINE 1: select '9223372036854775808=>1'::intmap;
+               ^
+select '1=>-10496585469345, 2=>10, 3=>1'::intmap->1;
+    ?column?     
+-----------------
+ -10496585469345
+(1 row)
+
+select intmap(array[1, null], array[5, null]);
+ERROR:  input arrays must not contain NULLs
+select intmap(array[1, 2], array[5, 10]);
+   intmap    
+-------------
+ 1=>5, 2=>10
+(1 row)
+
