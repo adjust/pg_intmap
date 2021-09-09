@@ -25,11 +25,12 @@ typedef struct
 
 typedef struct
 {
-    uint32_t varint_bytes;  /* bytes required to store all values in varint */
-    uint32_t bitpack_bytes; /* bytes required to store all values in bitpack */
+    uint32_t varint_size;   /* bytes required to store all values in varint */
+    uint32_t bitpack_size;  /* bytes required to store all values in bitpack */
     uint8_t num_bits;       /* sufficient number of bits per value to encode
                                using bit packing */
-    uint8_t best_encoding;
+    uint32_t best_size;
+    uint8_t  best_encoding;
     bool    use_zigzag;     /* use zigzag encoding to encode signed values */
 } ArrayStats;
 
@@ -41,9 +42,10 @@ static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n
 static void collect_stats(ArrayStats *stats, int64_t *vals, uint32_t n)
 {
     uint64_t max = 0;
-    uint64_t varint_bytes = 0;
+    uint64_t varint_size = 0;
     uint64_t mask = 0;
 
+    /* check for negative numbers */
     for (uint32_t i = 0; i < n; ++i)
         mask |= vals[i];
     stats->use_zigzag = mask & ((uint64_t) 1 << 63);
@@ -52,21 +54,23 @@ static void collect_stats(ArrayStats *stats, int64_t *vals, uint32_t n)
         /* encode with zigzag if needed */
         vals[i] = stats->use_zigzag ? zigzag_encode(vals[i]) : (uint64_t) vals[i];
 
-        /* count bytes needed for varing encoding */
-        varint_bytes += ((sizeof(int64_t) << 3) - __builtin_clzl(vals[i]) + 7) / 7;
+        /* count bytes needed for varint encoding */
+        varint_size += ((sizeof(int64_t) << 3) - __builtin_clzl(vals[i]) + 7 - 1) / 7;
 
         /* find max */
         max = max > (uint64_t) vals[i] ? max : (uint64_t) vals[i];
     }
 
-    stats->varint_bytes = varint_bytes;
+    stats->varint_size= varint_size;
     stats->num_bits = (sizeof(uint64_t) << 3) - __builtin_clzl(max);
 
     /* number of bits / 8 + 1 byte for bits length encoding */
-    stats->bitpack_bytes = ((n * stats->num_bits + 7) >> 3) + 1;
+    stats->bitpack_size = ((n * stats->num_bits + 7) >> 3) + 1;
 
-    stats->best_encoding = stats->varint_bytes < stats->bitpack_bytes ? \
+    stats->best_encoding = stats->varint_size < stats->bitpack_size ? \
         ENCODING_VARINT : ENCODING_BITPACK;
+    stats->best_size = stats->varint_size < stats->bitpack_size ?
+        stats->varint_size : stats->bitpack_size;
 }
 
 
@@ -238,30 +242,28 @@ static inline uint8_t *decoder_iter_finish(DecoderIter *it)
 PG_FUNCTION_INFO_V1(intmap_out);
 Datum intmap_out(PG_FUNCTION_ARGS)
 {
-    Datum in = PointerGetDatum(PG_DETOAST_DATUM(PG_GETARG_DATUM(0)));
-    uint64_t *keys;
-    uint64_t *values;
-    uint8_t *data = VARDATA(in);
-    uint64_t n;
-    uint8_t keys_encoding, vals_encoding;
+    Datum     in = PointerGetDatum(PG_DETOAST_DATUM(PG_GETARG_DATUM(0)));
+    uint8_t  *data = VARDATA(in);
+    uint64_t  n;
+    uint64_t  offset;    /* values array offset */
+    uint8_t   keys_enc, vals_enc;
+    DecoderIter keys_it, vals_it;
     StringInfoData str;
 
-    /* read the number of items */
+    /* read the number of items, encodings and values array offset */
     data = varint_decode(data, &n);
+    data = read_encodings(data, &keys_enc, &vals_enc);
+    data = varint_decode(data, &offset);
 
-    /* allocate memory for keys and values in a single palloc */
-    keys = palloc(sizeof(uint64_t) * n * 2);
-    values = keys + n;
-
-    data = read_encodings(data, &keys_encoding, &vals_encoding);
-
-    /* read keys and values */
-    data = decode_array(data, keys_encoding, keys, n);
-    data = decode_array(data, vals_encoding, values, n);
-
+    /* iterate through keys/values */
+    decoder_iter_init(&keys_it, keys_enc, data);
+    decoder_iter_init(&vals_it, vals_enc, data + offset);
     initStringInfo(&str);
-    for (uint32_t i = 0; i < n; ++i)
-        appendStringInfo(&str, i == 0 ? "%ld=>%ld" : ", %ld=>%ld", keys[i], values[i]);
+    for (uint32_t i = 0; i < n; ++i) {
+        appendStringInfo(&str, i == 0 ? "%ld=>%ld" : ", %ld=>%ld",
+                         decoder_iter_next(&keys_it),
+                         decoder_iter_next(&vals_it));
+    }
 
     PG_RETURN_CSTRING(str.data);
 }
@@ -271,6 +273,7 @@ static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n
     uint8_t    *out;
     uint8_t    *data;
     ArrayStats key_stats, val_stats;
+    uint8_t    *keys_start;
 
     /* TODO: estimate size */
     out = palloc0(VARHDRSZ + 5 + sizeof(uint64_t) * n * 2);
@@ -288,8 +291,12 @@ static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n
        key_stats.best_encoding | (key_stats.use_zigzag ? ENCODING_ZIGZAG : 0),
        val_stats.best_encoding | (val_stats.use_zigzag ? ENCODING_ZIGZAG : 0));
 
+    /* write values offset (relatively to keys array) */
+    keys_start = data = varint_encode(data, key_stats.best_size);
+
     /* Encode keys and values */
     data = encode_array(data, &key_stats, keys, n);
+    Assert(data == keys_start + key_stats.best_size);
     data = encode_array(data, &val_stats, values, n);
 
     SET_VARSIZE(out, data - out);
@@ -329,31 +336,24 @@ Datum intmap_get_val(PG_FUNCTION_ARGS)
     Datum    in = PointerGetDatum(PG_DETOAST_DATUM(PG_GETARG_DATUM(0)));
     uint64_t key = DatumGetUInt64(PG_GETARG_DATUM(1));
     uint8_t *data = VARDATA(in);
-    int32_t  found_idx = -1;
     uint64_t n;
-    uint8_t  keys_enc, vals_enc;
-    DecoderIter it;
+    uint64_t offset;
+    uint8_t  k_enc, v_enc;
+    DecoderIter k_it, v_it;
 
     /* read the number of items and the encodings */
     data = varint_decode(data, &n);
-    data = read_encodings(data, &keys_enc, &vals_enc);
+    data = read_encodings(data, &k_enc, &v_enc);
+    data = varint_decode(data, &offset);
 
     /* read keys */
-    decoder_iter_init(&it, keys_enc, data);
-    for (int i = 0; i < n; ++i)
-        if (decoder_iter_next(&it) == key)
-            found_idx = i;
-    data = decoder_iter_finish(&it);
+    decoder_iter_init(&k_it, k_enc, data);
+    decoder_iter_init(&v_it, v_enc, data + offset);
+    for (uint32_t i = 0; i < n; ++i) {
+        int64_t val = decoder_iter_next(&v_it);
 
-    /* read values */
-    if (found_idx >= 0) {
-        int64_t res;
-
-        decoder_iter_init(&it, vals_enc, data);
-        for (int i = 0; i <= found_idx; ++i)
-            res = decoder_iter_next(&it);
-
-        PG_RETURN_UINT64(res);
+        if (decoder_iter_next(&k_it) == key)
+            PG_RETURN_INT64(val);
     }
 
     /* key's not found */

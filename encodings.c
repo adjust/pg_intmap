@@ -9,14 +9,11 @@
 
 uint8_t *varint_encode(uint8_t *buf, uint64_t val)
 {
-    int      bits_left = INT64_BITSIZE - __builtin_clzl(val);
     uint64_t res = 0;
 
-    while (bits_left > 7) {
-        *buf = LEB_MASK | 0x7f & (uint8_t) val;
+    while (val > 0x7f) {
+        *buf++ = LEB_MASK | 0x7f & (uint8_t) val;
         val >>= 7;
-        buf++;
-        bits_left -= 7;
     }
     *buf = 0x7f & (uint8_t) val;
 
@@ -51,7 +48,7 @@ uint8_t *bitpack_encode(uint8_t *buf, const uint64_t *vals, uint32_t nvals, uint
         t |= (vals[i] & mask) << bits_used;
         bits_used += num_bits;
         
-        if (bits_used > INT64_BITSIZE)
+        if (bits_used >= INT64_BITSIZE)
         {
             uint8_t diff = bits_used - INT64_BITSIZE;
 
@@ -98,7 +95,8 @@ const uint8_t *bitpack_decode(const uint8_t *buf, uint64_t *out, uint32_t nvals,
             t >>= shift;
             bits_read = diff;
         }
-        t >>= num_bits;
+        else
+            t >>= num_bits;
         out++;
         i++;
     }
@@ -147,10 +145,11 @@ uint64_t bitpack_iter_next(BitpackIter *it)
         memcpy(&it->reg, it->buf, sizeof(uint64_t));
 
         out |= (it->reg & (it->mask >> shift)) << shift;
-        it->reg >>= shift;
+        it->reg >>= diff;
         it->bits_read = diff;
     }
-    it->reg >>= it->num_bits;
+    else
+        it->reg >>= it->num_bits;
 
     return out;
 }
