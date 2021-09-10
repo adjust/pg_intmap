@@ -36,7 +36,9 @@ typedef struct
 
 
 void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n);
+void parse_intarr(const char *c, int64_t **values, int *n);
 static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n);
+static Datum create_intarr_internal(uint64_t *values, uint32_t n);
 
 
 static void collect_stats(ArrayStats *stats, int64_t *vals, uint32_t n)
@@ -71,20 +73,6 @@ static void collect_stats(ArrayStats *stats, int64_t *vals, uint32_t n)
         ENCODING_VARINT : ENCODING_BITPACK;
     stats->best_size = stats->varint_size < stats->bitpack_size ?
         stats->varint_size : stats->bitpack_size;
-}
-
-
-PG_FUNCTION_INFO_V1(intmap_in);
-Datum intmap_in(PG_FUNCTION_ARGS)
-{
-    char    *in = PG_GETARG_CSTRING(0);
-    int64_t *keys;
-    int64_t *values;
-    int      n;
-
-    parse_intmap(in, &keys, &values, &n);
-
-    return create_intmap_internal(keys, values, n);
 }
 
 static inline uint8_t *write_num_bits(uint8_t *buf, uint8_t num_bits)
@@ -237,6 +225,19 @@ static inline uint8_t *decoder_iter_finish(DecoderIter *it)
         default:
             elog(ERROR, "unsupported encoding");
     }
+}
+
+PG_FUNCTION_INFO_V1(intmap_in);
+Datum intmap_in(PG_FUNCTION_ARGS)
+{
+    char    *in = PG_GETARG_CSTRING(0);
+    int64_t *keys;
+    int64_t *values;
+    int      n;
+
+    parse_intmap(in, &keys, &values, &n);
+
+    return create_intmap_internal(keys, values, n);
 }
 
 PG_FUNCTION_INFO_V1(intmap_out);
@@ -396,4 +397,104 @@ Datum intmap_meta(PG_FUNCTION_ARGS)
                      encoding_to_str(vals_encoding));
 
     PG_RETURN_CSTRING(str.data);
+}
+
+PG_FUNCTION_INFO_V1(intarr_in);
+Datum intarr_in(PG_FUNCTION_ARGS)
+{
+    char    *in = PG_GETARG_CSTRING(0);
+    int64_t *values;
+    int      n;
+
+    parse_intarr(in, &values, &n);
+
+    return create_intarr_internal(values, n);
+}
+
+static Datum create_intarr_internal(uint64_t *values, uint32_t n)
+{
+    uint8_t    *out;
+    uint8_t    *data;
+    ArrayStats  stats;
+
+    collect_stats(&stats, values, n);
+
+    /*
+     * Size estimation includes:
+     * - bytea header (4 bytes)
+     * - version + encoding (1 byte)
+     * - varint encoded number of items (max 5 bytes)
+     * - calculated size of encoded data
+     */
+    out = palloc0(MAXALIGN(VARHDRSZ + 1 + 5 + stats.best_size));
+    data = VARDATA(out);
+
+    /*
+     * write the encoding
+     * TODO: write version into the same byte as well
+     */
+    *data++ = stats.best_encoding | (stats.use_zigzag ? ENCODING_ZIGZAG : 0);
+
+    /* write the number of values */
+    data = varint_encode(data, n);
+
+    /* encode values */
+    data = encode_array(data, &stats, values, n);
+
+    SET_VARSIZE(out, data - out);
+    return PointerGetDatum(out);
+}
+
+PG_FUNCTION_INFO_V1(intarr_out);
+Datum intarr_out(PG_FUNCTION_ARGS)
+{
+    Datum     in = PointerGetDatum(PG_DETOAST_DATUM(PG_GETARG_DATUM(0)));
+    uint8_t  *data = VARDATA(in);
+    uint64_t  n;
+    uint8_t   encoding;
+    DecoderIter it;
+    StringInfoData str;
+
+    /* read the encoding and the number of items */
+    encoding = *data++;
+    data = varint_decode(data, &n);
+
+    /* iterate through values */
+    decoder_iter_init(&it, encoding, data);
+    initStringInfo(&str);
+    appendStringInfoChar(&str, '{');
+    for (uint32_t i = 0; i < n; ++i) {
+        appendStringInfo(&str, i == 0 ? "%ld" : ", %ld",
+                         decoder_iter_next(&it));
+    }
+    appendStringInfoChar(&str, '}');
+
+    PG_RETURN_CSTRING(str.data);
+}
+
+PG_FUNCTION_INFO_V1(intarr_get_val);
+Datum intarr_get_val(PG_FUNCTION_ARGS)
+{
+    Datum    in = PointerGetDatum(PG_DETOAST_DATUM(PG_GETARG_DATUM(0)));
+    uint32_t idx = PG_GETARG_INT64(1);
+    uint8_t *data = VARDATA(in);
+    uint64_t n;
+    uint8_t  encoding;
+    DecoderIter it;
+    int64_t  res;
+
+    /* read the encoding and the number of items */
+    encoding = *data++;
+    data = varint_decode(data, &n);
+
+    /* out of range */
+    if (idx < 1 || idx > n)
+        PG_RETURN_NULL();
+
+    /* iterate through values */
+    decoder_iter_init(&it, encoding, data);
+    for (int32_t i = 0; i < idx; ++i)
+        res = decoder_iter_next(&it);
+
+    PG_RETURN_INT64(res);
 }

@@ -34,3 +34,30 @@ CREATE FUNCTION intmap_meta(intmap)
 RETURNS cstring
 AS 'pg_intmap'
 LANGUAGE C IMMUTABLE STRICT;
+
+CREATE FUNCTION intarr_in(cstring)
+RETURNS intarr
+AS 'pg_intmap'
+LANGUAGE C IMMUTABLE STRICT;
+
+CREATE FUNCTION intarr_out(intarr)
+RETURNS cstring
+AS 'pg_intmap'
+LANGUAGE C IMMUTABLE STRICT;
+
+CREATE TYPE intarr (
+    INPUT   = intarr_in,
+    OUTPUT  = intarr_out,
+    STORAGE = EXTENDED
+);
+
+CREATE FUNCTION intarr_get_val(intarr, int4)
+RETURNS int8
+AS 'pg_intmap'
+LANGUAGE C IMMUTABLE STRICT;
+
+CREATE OPERATOR -> (
+    leftarg   = intarr,
+    rightarg  = int4,
+    procedure = intarr_get_val
+);
