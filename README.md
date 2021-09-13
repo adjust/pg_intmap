@@ -1,3 +1,5 @@
+![CI](https://github.com/adjust/pg_intmap/workflows/CI/badge.svg) ![experimental](https://img.shields.io/badge/status-experimental-orange)
+
 # pg_intmap
 
 Compressed integer containers.

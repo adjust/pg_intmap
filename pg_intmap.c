@@ -10,10 +10,10 @@
 PG_MODULE_MAGIC;
 
 
-#define ENCODING_PLAIN      0
-#define ENCODING_VARINT     1
-#define ENCODING_BITPACK    2
-#define ENCODING_ZIGZAG     8
+#define PLAIN_ENCODING      0
+#define VARINT_ENCODING     1
+#define BITPACK_ENCODING    2
+#define ZIGZAG_ENCODING     8
 
 
 typedef struct
@@ -34,9 +34,29 @@ typedef struct
     bool    use_zigzag;     /* use zigzag encoding to encode signed values */
 } ArrayStats;
 
+/*
+ * encodings.h declarations
+ *
+ * These may not be needed when optimization is enabled and functions are
+ * properly inlined. But just in case this isn't the case (and for debugging
+ * purposes)
+ */
+uint8_t *varint_encode(uint8_t *buf, uint64_t val);
+uint8_t *varint_decode(uint8_t *buf, uint64_t *out);
+uint8_t *bitpack_encode(uint8_t *buf, const uint64_t *vals, uint32_t nvals, uint8_t num_bits);
+uint8_t *bitpack_decode(uint8_t *buf, uint64_t *out, uint32_t nvals, uint8_t num_bits);
+uint64_t zigzag_encode(int64_t value);
+int64_t zigzag_decode(uint64_t value);
+void bitpack_iter_init(BitpackIter *it, uint8_t *buf, uint8_t num_bits);
+uint64_t bitpack_iter_next(BitpackIter *it);
+uint8_t *bitpack_iter_finish(BitpackIter *it);
 
+/*
+ * parse.c declarations
+ */
 void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n);
 void parse_intarr(const char *c, int64_t **values, int *n);
+
 static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n);
 static Datum create_intarr_internal(uint64_t *values, uint32_t n);
 
@@ -70,7 +90,7 @@ static void collect_stats(ArrayStats *stats, int64_t *vals, uint32_t n)
     stats->bitpack_size = ((n * stats->num_bits + 7) >> 3) + 1;
 
     stats->best_encoding = stats->varint_size < stats->bitpack_size ? \
-        ENCODING_VARINT : ENCODING_BITPACK;
+        VARINT_ENCODING : BITPACK_ENCODING;
     stats->best_size = stats->varint_size < stats->bitpack_size ?
         stats->varint_size : stats->bitpack_size;
 }
@@ -111,11 +131,11 @@ static inline uint8_t *encode_array(uint8_t *buf, ArrayStats *stats,
                                     int64_t *vals, uint32_t n)
 {
     switch (stats->best_encoding) {
-        case ENCODING_VARINT:
+        case VARINT_ENCODING:
             for (uint32_t i = 0; i < n; ++i)
                 buf = varint_encode(buf, vals[i]);
             break;
-        case ENCODING_BITPACK:
+        case BITPACK_ENCODING:
             buf = write_num_bits(buf, stats->num_bits);
             buf = bitpack_encode(buf, vals, n, stats->num_bits);
             break;
@@ -131,11 +151,11 @@ static inline uint8_t *decode_array(uint8_t *buf, uint8_t encoding,
 {
     switch (encoding & 0x7)
     {
-        case ENCODING_VARINT:
+        case VARINT_ENCODING:
             for (uint32_t i = 0; i < n; ++i)
                 buf = varint_decode(buf, &vals[i]);
             break;
-        case ENCODING_BITPACK:
+        case BITPACK_ENCODING:
             {
                 uint8_t num_bits;
 
@@ -147,7 +167,7 @@ static inline uint8_t *decode_array(uint8_t *buf, uint8_t encoding,
             elog(ERROR, "unsupported encoding");
     }
 
-    if (encoding & ENCODING_ZIGZAG)
+    if (encoding & ZIGZAG_ENCODING)
         for (uint32_t i = 0; i < n; ++i)
             vals[i] = zigzag_decode(vals[i]);
 
@@ -176,10 +196,10 @@ static inline void decoder_iter_init(DecoderIter *it, uint8_t encoding, uint8_t 
 
     switch (it->encoding)
     {
-        case ENCODING_VARINT:
+        case VARINT_ENCODING:
             it->u.varint.buf = buf;
             break;
-        case ENCODING_BITPACK:
+        case BITPACK_ENCODING:
             {
                 uint8_t     num_bits;
 
@@ -198,10 +218,10 @@ static inline int64_t decoder_iter_next(DecoderIter *it)
 
     switch (it->encoding)
     {
-        case ENCODING_VARINT:
+        case VARINT_ENCODING:
             it->u.varint.buf = varint_decode(it->u.varint.buf, &res);
             break;
-        case ENCODING_BITPACK:
+        case BITPACK_ENCODING:
             res = bitpack_iter_next(&it->u.bitpack);
             break;
         default:
@@ -218,9 +238,9 @@ static inline uint8_t *decoder_iter_finish(DecoderIter *it)
 {
     switch (it->encoding)
     {
-        case ENCODING_VARINT:
+        case VARINT_ENCODING:
             return it->u.varint.buf;
-        case ENCODING_BITPACK:
+        case BITPACK_ENCODING:
             return bitpack_iter_finish(&it->u.bitpack);
         default:
             elog(ERROR, "unsupported encoding");
@@ -289,8 +309,8 @@ static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n
     collect_stats(&val_stats, values, n);
 
     data = write_encodings(data,
-       key_stats.best_encoding | (key_stats.use_zigzag ? ENCODING_ZIGZAG : 0),
-       val_stats.best_encoding | (val_stats.use_zigzag ? ENCODING_ZIGZAG : 0));
+       key_stats.best_encoding | (key_stats.use_zigzag ? ZIGZAG_ENCODING : 0),
+       val_stats.best_encoding | (val_stats.use_zigzag ? ZIGZAG_ENCODING : 0));
 
     /* write values offset (relatively to keys array) */
     keys_start = data = varint_encode(data, key_stats.best_size);
@@ -364,13 +384,13 @@ Datum intmap_get_val(PG_FUNCTION_ARGS)
 static inline const char *encoding_to_str(uint8_t encoding)
 {
     switch (encoding) {
-        case ENCODING_VARINT:
+        case VARINT_ENCODING:
             return "varint";
-        case ENCODING_BITPACK:
+        case BITPACK_ENCODING:
             return "bit-pack";
-        case ENCODING_VARINT | ENCODING_ZIGZAG:
+        case VARINT_ENCODING | ZIGZAG_ENCODING:
             return "varint (zig-zag)";
-        case ENCODING_BITPACK | ENCODING_ZIGZAG:
+        case BITPACK_ENCODING | ZIGZAG_ENCODING:
             return "bit-pack (zig-zag)";
         default:
             elog(ERROR, "unexpected encoding");
@@ -433,7 +453,7 @@ static Datum create_intarr_internal(uint64_t *values, uint32_t n)
      * write the encoding
      * TODO: write version into the same byte as well
      */
-    *data++ = stats.best_encoding | (stats.use_zigzag ? ENCODING_ZIGZAG : 0);
+    *data++ = stats.best_encoding | (stats.use_zigzag ? ZIGZAG_ENCODING : 0);
 
     /* write the number of values */
     data = varint_encode(data, n);
