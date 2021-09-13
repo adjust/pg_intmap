@@ -25,6 +25,44 @@ static inline const char* parse_int(const char *c, int64_t *out)
     return end;
 }
 
+static inline void intmap_qsort_internal(int64_t *keys, int64_t *values,
+                                         int32_t low, int32_t high)
+{
+    int64_t mid = keys[(low + high) / 2];
+    int32_t i = low, j = high - 1;
+
+    if (low >= high)
+        return;
+
+    while (true) {
+        int64_t tmp;
+
+        while (keys[i] < mid) i++;
+        while (keys[j] > mid) j--;
+
+        if (i >= j)
+            break;
+
+        /* swap elements */
+        tmp = keys[i];
+        keys[i] = keys[j];
+        keys[j] = tmp;
+
+        tmp = values[i];
+        values[i] = values[j];
+        values[j] = tmp;
+        i++;
+        j--;
+    }
+    intmap_qsort_internal(keys, values, low, j);
+    intmap_qsort_internal(keys, values, j + 1, high);
+}
+
+void intmap_qsort(int64_t *keys, int64_t *values, int32_t n)
+{
+    intmap_qsort_internal(keys, values, 0, n);
+}
+
 void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n)
 {
     IMParseState state = IM_KEY;
@@ -94,6 +132,8 @@ void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n)
 
     if (state != IM_DELIM)
         elog(ERROR, "unexpected end of string");
+
+    intmap_qsort(*keys, *values, *n);
 }
 
 void parse_intarr(const char *c, int64_t **values, int *n)

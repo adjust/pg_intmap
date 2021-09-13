@@ -56,6 +56,7 @@ uint8_t *bitpack_iter_finish(BitpackIter *it);
  */
 void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n);
 void parse_intarr(const char *c, int64_t **values, int *n);
+void intmap_qsort(int64_t *keys, int64_t *values, int32_t n);
 
 static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n);
 static Datum create_intarr_internal(uint64_t *values, uint32_t n);
@@ -346,6 +347,8 @@ Datum create_intmap(PG_FUNCTION_ARGS)
     for (uint32_t i = 0; i < nkeys; ++i)
         if (null_keys[i] | null_values[i])
             elog(ERROR, "input arrays must not contain NULLs");
+
+    intmap_qsort(keys, values, nkeys);
 
     return create_intmap_internal(keys, values, nkeys);
 }
