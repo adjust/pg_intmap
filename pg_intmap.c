@@ -9,6 +9,7 @@
 
 PG_MODULE_MAGIC;
 
+#define INTMAP_VERSION      0
 
 #define PLAIN_ENCODING      0
 #define VARINT_ENCODING     1
@@ -18,9 +19,11 @@ PG_MODULE_MAGIC;
 
 typedef struct
 {
-    /* uint8 version; TODO */
-    uint32 nitems;
-    uint32 valoff;  /* values offset */
+    uint64_t    nitems;
+    uint64_t    valoff;  /* values offset */
+    uint8_t     key_enc;
+    uint8_t     val_enc;
+    uint8_t     version;
 } IntMapHeader;
 
 typedef struct
@@ -108,21 +111,74 @@ static inline uint8_t *read_num_bits(uint8_t *buf, uint8_t *num_bits)
     return ++buf;
 }
 
-static inline uint8_t *write_encodings(uint8_t *buf,
-                                       uint8_t keys_encoding,
-                                       uint8_t vals_encoding)
+/*
+ * intmap_read_header
+ *      Decode intmap header.
+ *
+ * intmap header structure:
+ * - version (3 bits)
+ * - number of items encoded with modified varint (4 bits of the first byte +
+ *   1 bit marker potentially followed by a few more bytes);
+ * - encodings (8 bits):
+ *    > 1 bit:   zigzag encoding for keys (true/false);
+ *    > 3 bits:  keys encoding (one of *_ENCODING values);
+ *    > 1 bit:   ziazag encoding for values (true/false);
+ *    > 3 bits:  values encoding;
+ * - values offset encoded using varint
+ */
+static inline uint8_t *intmap_read_header(uint8_t *buf, IntMapHeader *h)
 {
-    *buf = keys_encoding << 4 | (vals_encoding & 0xF);
-    return ++buf;
+    h->version = *buf >> 5;
+
+    /* read the number of items */
+    h->nitems = *buf & 0x0f;
+    if (*buf++ & 0x10) {
+        uint64_t head;
+
+        buf = varint_decode(buf, &head);
+        h->nitems = head << 4 | h->nitems;
+    }
+
+    /* read encodings */
+    h->key_enc = *buf >> 4;
+    h->val_enc = *buf++ & 0x0f;
+
+    /* read values offset */
+    buf = varint_decode(buf, &h->valoff);
+
+    return buf;
 }
 
-static inline uint8_t *read_encodings(uint8_t *buf,
-                                      uint8_t *keys_encoding,
-                                      uint8_t *vals_encoding)
+/*
+ * intmap_write_header
+ *      Encode intmap header.
+ */
+static inline uint8_t *intmap_write_header(uint8_t *buf, IntMapHeader *h)
 {
-    *keys_encoding = *buf >> 4;
-    *vals_encoding = *buf & 0xF;
-    return ++buf;
+    uint64_t n = h->nitems;
+
+    /* write 3 bits version num */
+    *buf = INTMAP_VERSION << 5;
+
+    /*
+     * Write the first 4 bits of varint encoded nitems. If the number of items
+     * doesn't fit run regular varint on what's left.
+     */
+    if (n > 0x0f) {
+        *buf++ |= 0x10 | 0x0f & (uint8_t) n;
+        n >>= 4;
+
+        buf = varint_encode(buf, n);
+    } else
+        *buf++ |= n;
+
+    /* write encodings */
+    *buf++ = h->key_enc << 4 | (h->val_enc & 0xF);
+
+    /* write values offset */
+    buf = varint_encode(buf, h->valoff);
+
+    return buf;
 }
 
 /*
@@ -264,27 +320,22 @@ Datum intmap_in(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(intmap_out);
 Datum intmap_out(PG_FUNCTION_ARGS)
 {
-    Datum     in = PointerGetDatum(PG_DETOAST_DATUM(PG_GETARG_DATUM(0)));
-    uint8_t  *data = VARDATA(in);
-    uint64_t  n;
-    uint64_t  offset;    /* values array offset */
-    uint8_t   keys_enc, vals_enc;
-    DecoderIter keys_it, vals_it;
+    Datum        in = PointerGetDatum(PG_DETOAST_DATUM(PG_GETARG_DATUM(0)));
+    uint8_t     *data = VARDATA(in);
+    IntMapHeader h;
+    DecoderIter  k_it, v_it;
     StringInfoData str;
 
-    /* read the number of items, encodings and values array offset */
-    data = varint_decode(data, &n);
-    data = read_encodings(data, &keys_enc, &vals_enc);
-    data = varint_decode(data, &offset);
+    data = intmap_read_header(data, &h);
 
     /* iterate through keys/values */
-    decoder_iter_init(&keys_it, keys_enc, data);
-    decoder_iter_init(&vals_it, vals_enc, data + offset);
+    decoder_iter_init(&k_it, h.key_enc, data);
+    decoder_iter_init(&v_it, h.val_enc, data + h.valoff);
     initStringInfo(&str);
-    for (uint32_t i = 0; i < n; ++i) {
+    for (uint32_t i = 0; i < h.nitems; ++i) {
         appendStringInfo(&str, i == 0 ? "%ld=>%ld" : ", %ld=>%ld",
-                         decoder_iter_next(&keys_it),
-                         decoder_iter_next(&vals_it));
+                         decoder_iter_next(&k_it),
+                         decoder_iter_next(&v_it));
     }
 
     PG_RETURN_CSTRING(str.data);
@@ -296,25 +347,22 @@ static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n
     uint8_t    *data;
     ArrayStats key_stats, val_stats;
     uint8_t    *keys_start;
+    IntMapHeader h;
 
     /* TODO: estimate size */
     out = palloc0(VARHDRSZ + 5 + sizeof(uint64_t) * n * 2);
     data = VARDATA(out);
 
-    /* 
-     * Write header
-     * TODO: add version, values offset
-     */
-    data = varint_encode(data, n);
     collect_stats(&key_stats, keys, n);
     collect_stats(&val_stats, values, n);
 
-    data = write_encodings(data,
-       key_stats.best_encoding | (key_stats.use_zigzag ? ZIGZAG_ENCODING : 0),
-       val_stats.best_encoding | (val_stats.use_zigzag ? ZIGZAG_ENCODING : 0));
-
-    /* write values offset (relatively to keys array) */
-    keys_start = data = varint_encode(data, key_stats.best_size);
+    /* Write header */
+    h.version = INTMAP_VERSION;
+    h.nitems  = n;
+    h.key_enc = key_stats.best_encoding | (key_stats.use_zigzag ? ZIGZAG_ENCODING : 0);
+    h.val_enc = val_stats.best_encoding | (val_stats.use_zigzag ? ZIGZAG_ENCODING : 0);
+    h.valoff = key_stats.best_size;
+    keys_start = data = intmap_write_header(data, &h);
 
     /* Encode keys and values */
     data = encode_array(data, &key_stats, keys, n);
@@ -357,23 +405,19 @@ Datum create_intmap(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(intmap_get_val);
 Datum intmap_get_val(PG_FUNCTION_ARGS)
 {
-    Datum    in = PointerGetDatum(PG_DETOAST_DATUM(PG_GETARG_DATUM(0)));
-    uint64_t key = DatumGetUInt64(PG_GETARG_DATUM(1));
-    uint8_t *data = VARDATA(in);
-    uint64_t n;
-    uint64_t offset;
-    uint8_t  k_enc, v_enc;
-    DecoderIter k_it, v_it;
+    Datum        in = PointerGetDatum(PG_DETOAST_DATUM(PG_GETARG_DATUM(0)));
+    uint64_t     key = DatumGetUInt64(PG_GETARG_DATUM(1));
+    uint8_t     *data = VARDATA(in);
+    IntMapHeader h;
+    DecoderIter  k_it, v_it;
 
-    /* read the number of items and the encodings */
-    data = varint_decode(data, &n);
-    data = read_encodings(data, &k_enc, &v_enc);
-    data = varint_decode(data, &offset);
+    /* read header */
+    data = intmap_read_header(data, &h);
 
     /* read keys */
-    decoder_iter_init(&k_it, k_enc, data);
-    decoder_iter_init(&v_it, v_enc, data + offset);
-    for (uint32_t i = 0; i < n; ++i) {
+    decoder_iter_init(&k_it, h.key_enc, data);
+    decoder_iter_init(&v_it, h.val_enc, data + h.valoff);
+    for (uint32_t i = 0; i < h.nitems; ++i) {
         int64_t val = decoder_iter_next(&v_it);
 
         if (decoder_iter_next(&k_it) == key)
@@ -405,19 +449,18 @@ Datum intmap_meta(PG_FUNCTION_ARGS)
 {
     Datum in = PointerGetDatum(PG_DETOAST_DATUM(PG_GETARG_DATUM(0)));
     uint8_t *data = VARDATA(in);
-    uint64_t n;
-    uint8_t keys_encoding, vals_encoding;
+    IntMapHeader h;
     StringInfoData str;
 
-    /* read the number of items and encodings */
-    data = varint_decode(data, &n);
-    data = read_encodings(data, &keys_encoding, &vals_encoding);
+    /* read header */
+    data = intmap_read_header(data, &h);
 
     initStringInfo(&str);
-    appendStringInfo(&str, "count: %u, keys encoding: %s, values encoding: %s",
-                     n,
-                     encoding_to_str(keys_encoding),
-                     encoding_to_str(vals_encoding));
+    appendStringInfo(&str, "ver: %u, num: %u, keys encoding: %s, values encoding: %s",
+                     h.version,
+                     h.nitems,
+                     encoding_to_str(h.key_enc),
+                     encoding_to_str(h.val_enc));
 
     PG_RETURN_CSTRING(str.data);
 }

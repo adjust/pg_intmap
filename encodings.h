@@ -37,11 +37,9 @@ inline uint8_t *varint_decode(uint8_t *buf, uint64_t *out)
     uint64_t res = 0;
     uint8_t i = 0;
 
-    while (*buf & VI_MASK) {
-        res |= (uint64_t)(*buf & ~VI_MASK) << (7 * i);
-        buf++;
-        i++;
-    }
+    while (*buf & VI_MASK)
+        res |= (uint64_t)(*buf++ & ~VI_MASK) << (7 * i++);
+
     res |= (uint64_t)(*buf & ~VI_MASK) << (7 * i); 
     *out = res;
 

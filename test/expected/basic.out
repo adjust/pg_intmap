@@ -1,14 +1,14 @@
 create extension pg_intmap;
 select intmap_meta('85469345=>3, 2=>153, 3=>123');
-                        intmap_meta                         
-------------------------------------------------------------
- count: 3, keys encoding: varint, values encoding: bit-pack
+                           intmap_meta                            
+------------------------------------------------------------------
+ ver: 0, num: 3, keys encoding: varint, values encoding: bit-pack
 (1 row)
 
 select intmap_meta('-85469345=>3, 2=>153, 3=>-123');
-                                  intmap_meta                                   
---------------------------------------------------------------------------------
- count: 3, keys encoding: varint (zig-zag), values encoding: bit-pack (zig-zag)
+                                     intmap_meta                                      
+--------------------------------------------------------------------------------------
+ ver: 0, num: 3, keys encoding: varint (zig-zag), values encoding: bit-pack (zig-zag)
 (1 row)
 
 select '85469345=>3, 2=>153, 3=>123'::intmap;
