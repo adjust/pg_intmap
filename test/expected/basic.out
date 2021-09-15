@@ -23,6 +23,12 @@ select '-85469345=>3, 2=>153, 3=>123'::intmap;
  -85469345=>3, 2=>153, 3=>123
 (1 row)
 
+select ''::intmap;
+ intmap 
+--------
+ 
+(1 row)
+
 select '9223372036854775807=>1'::intmap;
          intmap         
 ------------------------
@@ -45,5 +51,17 @@ select intmap(array[1, 2], array[5, 10]);
    intmap    
 -------------
  1=>5, 2=>10
+(1 row)
+
+select '{1, 2}'::intarr;
+ intarr 
+--------
+ {1, 2}
+(1 row)
+
+select '{}'::intarr;
+ intarr 
+--------
+ {}
 (1 row)
 

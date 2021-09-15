@@ -3,7 +3,8 @@
 
 
 typedef enum {
-    IM_KEY = 0,
+    IM_MAP_START = 0,
+    IM_KEY,
     IM_KV_DELIM,
     IM_VALUE,
     IM_DELIM,
@@ -65,7 +66,7 @@ void intmap_qsort(int64_t *keys, int64_t *values, int32_t n)
 
 void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n)
 {
-    IMParseState state = IM_KEY;
+    IMParseState state = IM_MAP_START;
     const char *s = c;
     int         i = 0;
 
@@ -80,6 +81,7 @@ void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n)
     /* allocate keys and values arrays */
     *keys = palloc(sizeof(int64_t) * *n * 2);
     *values = *keys + *n;
+    *n = 0;
 
     /* parse */
     while (*c) {
@@ -91,6 +93,7 @@ void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n)
             break;
 
         switch(state) {
+            case IM_MAP_START:
             case IM_KEY:
                 {
                     int64_t key;
@@ -114,6 +117,7 @@ void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n)
 
                     c = parse_int(c, &val);
                     (*values)[i++] = val;
+                    (*n)++;
                     state = IM_DELIM;
                     break;
                 }
@@ -130,7 +134,7 @@ void parse_intmap(const char *c, int64_t **keys, int64_t **values, int *n)
         }
     }
 
-    if (state != IM_DELIM)
+    if (state != IM_DELIM && state != IM_MAP_START)
         elog(ERROR, "unexpected end of string");
 
     intmap_qsort(*keys, *values, *n);
@@ -155,8 +159,7 @@ void parse_intarr(const char *c, int64_t **values, int *n)
 
     while (*c) {
         /* skip spaces */
-        while (isspace(*c))
-            c++;
+        while (isspace(*c)) c++;
 
         if (!*c)
             break;
@@ -166,7 +169,16 @@ void parse_intarr(const char *c, int64_t **values, int *n)
                 if (*c != '{')
                     elog(ERROR, "expected '{', but found '%s'", c);
                 c++;
-                state = IM_VALUE;
+
+                /* skip spaces */
+                while (isspace(*c)) c++;
+
+                if (unlikely(*c == '}')) {
+                    state = IM_ARR_END;
+                    *n = 0;
+                    c++;
+                } else
+                    state = IM_VALUE;
                 break;
 
             case IM_VALUE:
