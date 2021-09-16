@@ -9,14 +9,19 @@
 #define INT64_BITSIZE (sizeof(int64_t) << 3)
 
 
-typedef struct
-{
+typedef struct {
     uint8_t    *buf;
     uint64_t    mask;
     uint8_t     num_bits;
     uint8_t     bits_read;
     uint64_t    reg;
 } BitpackIter;
+
+typedef struct {
+    bool        first;
+    uint64_t    base;
+    BitpackIter bp_iter;
+}  DeltaIter;
 
 
 inline uint8_t *varint_encode(uint8_t *buf, uint64_t val)
@@ -162,6 +167,72 @@ inline uint64_t bitpack_iter_next(BitpackIter *it)
         it->reg >>= it->num_bits;
 
     return out;
+}
+
+/*
+ * Note: modifies the original array!
+ */
+inline uint8_t *delta_encode(uint8_t *buf, uint64_t *vals, uint32_t n,
+                             uint8_t delta_num_bits)
+{
+    uint64_t base;
+
+    Assert(n > 0);
+    base = vals[0];
+    buf = varint_encode(buf, base);
+
+    /* calculate deltas */
+    for (uint32_t i = 1; i < n; ++i) {
+        uint64_t new_base = vals[i];
+
+        vals[i] = vals[i] - base;
+        base = new_base;
+    }
+    buf = bitpack_encode(buf, vals + 1, n - 1, delta_num_bits);
+
+    return buf;
+}
+
+inline uint8_t *delta_decode(uint8_t *buf, uint64_t *vals, uint32_t n,
+                             uint8_t delta_num_bits)
+{
+    buf = varint_decode(buf, &vals[0]);
+    buf = bitpack_decode(buf, vals + 1, n - 1, delta_num_bits);
+    for (uint32_t i = 1; i < n; ++i) {
+        vals[i] = vals[i - 1] + vals[i];
+    }
+}
+
+inline void delta_iter_init(DeltaIter *it, uint8_t *buf, uint8_t num_bits)
+{
+    buf = varint_decode(buf, &it->base);
+    it->first = true;
+    bitpack_iter_init(&it->bp_iter, buf, num_bits);
+}
+
+inline uint8_t *delta_iter_finish(DeltaIter *it)
+{
+    return bitpack_iter_finish(&it->bp_iter);
+}
+
+inline uint64_t delta_iter_next(DeltaIter *it)
+{
+    uint64_t res;
+
+#if 0
+    it->base = !it->first ?
+        it->base + bitpack_iter_next(&it->bp_iter) :
+        it->base;
+#endif
+
+    if (!it->first) {
+        uint64_t delta = bitpack_iter_next(&it->bp_iter);
+        it->base = it->base + delta;
+    }
+
+    it->first = false;
+
+    return it->base;
 }
 
 inline uint64_t zigzag_encode(int64_t value)
