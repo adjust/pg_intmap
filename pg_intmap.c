@@ -37,8 +37,8 @@ typedef struct
     uint8_t  delta_num_bits;
     uint32_t best_size;
     uint8_t  best_encoding;
-    bool     use_zigzag;    /* use zigzag encoding to encode signed values */
-    bool     delta_zigzag;  /* use zigzag to encode deltas */
+    bool     is_signed;     /* contains signed values */
+    bool     is_delta_signed; /* deltas contain signed values */
 } ArrayStats;
 
 /*
@@ -76,56 +76,64 @@ static Datum create_intarr_internal(uint64_t *values, uint32_t n);
 #define MEANINGFUL_BITS(x) ((sizeof(int64_t) << 3) - __builtin_clzl(x))
 #define VARINT_SIZE(x) ((MEANINGFUL_BITS(x) + 7 - 1) / 7)
 
+/* ceil(number of bits / 8) */
+#define BITPACK_SIZE(n, num_bits) (((n) * (num_bits) + 7) >> 3)
+
 static void collect_stats(ArrayStats *stats, int64_t *vals, uint32_t n)
 {
-    uint64_t max = 0;
-    int64_t  delta_max = 0;
     uint64_t varint_size = 0;
     uint64_t mask = 0;
     uint64_t delta_mask = 0;
-    int64_t  base;
+    int64_t  delta_base;
 
     if (n == 0)
         return;
 
     /* delta encoding base */
-    base = vals[0];
+    delta_base = vals[0];
 
     /* check for negative numbers */
     for (uint32_t i = 0; i < n; ++i) {
         mask |= vals[i];
-        delta_mask |= vals[i] - base;
-        base = vals[i];
+        delta_mask |= vals[i] - delta_base;
+        delta_base = vals[i];
     }
-    stats->use_zigzag = mask & ((uint64_t) 1 << 63);
-    stats->delta_zigzag = delta_mask & ((uint64_t) 1 << 63);
+    stats->is_signed = mask & ((uint64_t) 1 << 63);
+    stats->is_delta_signed = delta_mask & ((uint64_t) 1 << 63);
 
-    base = vals[0];
+    mask = delta_mask = 0;
+    delta_base = vals[0];
     for (uint32_t i = 0; i < n; ++i) {
-        int64_t delta;
+        int64_t  delta;
+        uint64_t zz_val;    /* zigzaged value */
+        uint64_t zz_delta;  /* zigzaged delta */
 
-        delta = vals[i] - base;
-        base = vals[i];
+        delta = vals[i] - delta_base;
+        zz_delta = stats->is_delta_signed ? zigzag_encode(delta) : (uint64_t) delta;
+        delta_base = vals[i];
 
         /* encode with zigzag if needed */
-        vals[i] = stats->use_zigzag ? zigzag_encode(vals[i]) : (uint64_t) vals[i];
+        zz_val = stats->is_signed ? zigzag_encode(vals[i]) : (uint64_t) vals[i];
 
         /* count bytes needed for varint encoding */
-        varint_size += VARINT_SIZE(vals[i]);
+        varint_size += VARINT_SIZE(zz_val);
 
-        /* find max */
-        max = max > (uint64_t) vals[i] ? max : (uint64_t) vals[i];
-        delta_max = delta_max > delta ? delta_max : delta;
+        /*
+         * Summarize bitwise values to find the sufficient number of bits to
+         * represent them all.
+         */
+        mask |= zz_val;
+        delta_mask |= zz_delta;
     }
 
-    stats->num_bits = MEANINGFUL_BITS(max);
-    stats->delta_num_bits = MEANINGFUL_BITS(delta_max);
+    stats->num_bits = MEANINGFUL_BITS(mask);
+    stats->delta_num_bits = MEANINGFUL_BITS(delta_mask);
 
-    /* number of bits / 8 + 1 byte for bits length encoding */
-    stats->bitpack_size = ((n * stats->num_bits + 7) >> 3) + 1;
+    /* +1 byte for bits length encoding */
+    stats->bitpack_size = BITPACK_SIZE(n, stats->num_bits) + 1;
 
-    uint32_t base_size = VARINT_SIZE(base);
-    stats->delta_size = (((n - 1) * stats->delta_num_bits + 7) >> 3) + 1 + base_size;
+    uint32_t base_size = VARINT_SIZE(vals[0]);
+    stats->delta_size = BITPACK_SIZE(n - 1, stats->delta_num_bits) + 1 + base_size;
 
     stats->varint_size = varint_size;
 
@@ -243,10 +251,17 @@ static inline uint8_t *encode_array(uint8_t *buf, ArrayStats *stats,
 {
     switch (stats->best_encoding) {
         case VARINT_ENCODING:
-            for (uint32_t i = 0; i < n; ++i)
-                buf = varint_encode(buf, vals[i]);
+            for (uint32_t i = 0; i < n; ++i) {
+                uint64_t v;
+
+                v = stats->is_signed ? zigzag_encode(vals[i]) : (uint64_t) vals[i];
+                buf = varint_encode(buf, v);
+            }
             break;
         case BITPACK_ENCODING:
+            if (stats->is_signed)
+                for (uint32_t i = 0; i < n; ++i)
+                    vals[i] = zigzag_encode(vals[i]);
             buf = write_num_bits(buf, stats->num_bits);
             buf = bitpack_encode(buf, vals, n, stats->num_bits);
             break;
@@ -262,13 +277,17 @@ static inline uint8_t *encode_array(uint8_t *buf, ArrayStats *stats,
 }
 
 static inline uint8_t *decode_array(uint8_t *buf, uint8_t encoding,
-                                    uint64_t *vals, uint32_t n)
+                                    int64_t *vals, uint32_t n)
 {
     switch (encoding & 0x7)
     {
         case VARINT_ENCODING:
-            for (uint32_t i = 0; i < n; ++i)
-                buf = varint_decode(buf, &vals[i]);
+            for (uint32_t i = 0; i < n; ++i) {
+                uint64_t    v;
+
+                buf = varint_decode(buf, &v);
+                vals[i] = encoding & ZIGZAG_ENCODING ? zigzag_decode(v) : (int64_t) v; 
+            }
             break;
         case BITPACK_ENCODING:
             {
@@ -276,6 +295,10 @@ static inline uint8_t *decode_array(uint8_t *buf, uint8_t encoding,
 
                 buf = read_num_bits(buf, &num_bits);
                 buf = bitpack_decode(buf, vals, n, num_bits);
+
+                if (encoding & ZIGZAG_ENCODING)
+                    for (uint32_t i = 0; i < n; ++i)
+                        vals[i] = zigzag_decode(vals[i]);
                 break;
             }
         case DELTA_ENCODING:
@@ -289,10 +312,6 @@ static inline uint8_t *decode_array(uint8_t *buf, uint8_t encoding,
         default:
             elog(ERROR, "unsupported encoding");
     }
-
-    if (encoding & ZIGZAG_ENCODING)
-        for (uint32_t i = 0; i < n; ++i)
-            vals[i] = zigzag_decode(vals[i]);
 
     return buf;
 }
@@ -444,8 +463,8 @@ static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n
     /* Write header */
     h.version = INTMAP_VERSION;
     h.nitems  = n;
-    h.key_enc = key_stats.best_encoding | (key_stats.use_zigzag ? ZIGZAG_ENCODING : 0);
-    h.val_enc = val_stats.best_encoding | (val_stats.use_zigzag ? ZIGZAG_ENCODING : 0);
+    h.key_enc = key_stats.best_encoding | (key_stats.is_signed ? ZIGZAG_ENCODING : 0);
+    h.val_enc = val_stats.best_encoding | (val_stats.is_signed ? ZIGZAG_ENCODING : 0);
     h.valoff = key_stats.best_size;
     keys_start = data = intmap_write_header(data, &h);
 
@@ -593,7 +612,7 @@ static Datum create_intarr_internal(uint64_t *values, uint32_t n)
      * write the encoding and version
      */
     *data = INTMAP_VERSION << 5;
-    *data++ |= stats.best_encoding | (stats.use_zigzag ? ZIGZAG_ENCODING : 0);
+    *data++ |= stats.best_encoding | (stats.is_signed ? ZIGZAG_ENCODING : 0);
 
     /* write the number of values */
     data = varint_encode(data, n);
