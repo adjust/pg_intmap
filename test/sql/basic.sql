@@ -11,5 +11,11 @@ select '1=>-10496585469345, 2=>10, 3=>1'::intmap->1;
 select intmap(array[1, null], array[5, null]);
 select intmap(array[1, 2], array[5, 10]);
 
+-- delta encoding
+select '10001=>-10001, 10002=>-10002, 10003=>-10003'::intmap;
+select '10001=>-10003, 10002=>-10002, 10003=>-10001'::intmap;
+select intmap_meta('10001=>-10003, 10002=>-10002, 10003=>-10001'::intmap);
+
+-- arrays
 select '{1, 2}'::intarr;
 select '{}'::intarr;

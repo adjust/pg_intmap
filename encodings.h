@@ -19,10 +19,26 @@ typedef struct {
 
 typedef struct {
     bool        first;
-    uint64_t    base;
+    bool        delta_signed;
+    int64_t     base;
     BitpackIter bp_iter;
 }  DeltaIter;
 
+
+inline uint64_t zigzag_encode(int64_t value)
+{
+    return (value << 1) ^ (value >> (INT64_BITSIZE - 1));
+}
+
+inline int64_t zigzag_decode(uint64_t value)
+{
+    /*
+     * Operator '>>' on a signed integer replicates the highest bit,
+     * so (x << 63 >> 63) would return either bitmask consisting of all 0s
+     * or all 1s depending on the sign bit.
+     */
+    return ((int64_t) value << INT64_BITSIZE - 1 >> INT64_BITSIZE - 1) ^ (value >> 1);
+}
 
 inline uint8_t *varint_encode(uint8_t *buf, uint64_t val)
 {
@@ -176,20 +192,21 @@ inline uint64_t bitpack_iter_next(BitpackIter *it)
 /*
  * Note: modifies the original array!
  */
-inline uint8_t *delta_encode(uint8_t *buf, uint64_t *vals, uint32_t n,
-                             uint8_t delta_num_bits)
+inline uint8_t *delta_encode(uint8_t *buf, int64_t *vals, uint32_t n,
+                             uint8_t delta_num_bits, bool delta_signed)
 {
-    uint64_t base;
+    int64_t base;
 
     Assert(n > 0);
     base = vals[0];
-    buf = varint_encode(buf, base);
+    buf = varint_encode(buf, base < 0 ? zigzag_encode(base) : (uint64_t) base);
 
     /* calculate deltas */
     for (uint32_t i = 1; i < n; ++i) {
-        uint64_t new_base = vals[i];
+        int64_t new_base = vals[i];
+        int64_t delta = vals[i] - base;
 
-        vals[i] = vals[i] - base;
+        vals[i] = delta_signed ? (int64_t) zigzag_encode(delta) : delta;
         base = new_base;
     }
     buf = bitpack_encode(buf, vals + 1, n - 1, delta_num_bits);
@@ -197,21 +214,26 @@ inline uint8_t *delta_encode(uint8_t *buf, uint64_t *vals, uint32_t n,
     return buf;
 }
 
-inline uint8_t *delta_decode(uint8_t *buf, uint64_t *vals, uint32_t n,
-                             uint8_t delta_num_bits)
+inline uint8_t *delta_decode(uint8_t *buf, int64_t *vals, uint32_t n,
+                             uint8_t delta_num_bits, bool delta_signed)
 {
     buf = varint_decode(buf, &vals[0]);
     buf = bitpack_decode(buf, vals + 1, n - 1, delta_num_bits);
     for (uint32_t i = 1; i < n; ++i) {
-        vals[i] = vals[i - 1] + vals[i];
+        uint64_t delta = delta_signed ? zigzag_decode(vals[i]) : vals[i];
+
+        vals[i] = vals[i - 1] + delta;
     }
 }
 
-inline void delta_iter_init(DeltaIter *it, uint8_t *buf, uint8_t num_bits)
+inline void delta_iter_init(DeltaIter *it, uint8_t *buf, bool base_signed,
+                            uint8_t delta_num_bits, bool delta_signed)
 {
     buf = varint_decode(buf, &it->base);
+    it->base = base_signed ? zigzag_decode(it->base) : it->base;
     it->first = true;
-    bitpack_iter_init(&it->bp_iter, buf, num_bits);
+    it->delta_signed = delta_signed;
+    bitpack_iter_init(&it->bp_iter, buf, delta_num_bits);
 }
 
 inline uint8_t *delta_iter_finish(DeltaIter *it)
@@ -223,35 +245,15 @@ inline uint64_t delta_iter_next(DeltaIter *it)
 {
     uint64_t res;
 
-#if 0
     it->base = !it->first ?
-        it->base + bitpack_iter_next(&it->bp_iter) :
-        it->base;
-#endif
-
-    if (!it->first) {
-        uint64_t delta = bitpack_iter_next(&it->bp_iter);
-        it->base = it->base + delta;
-    }
-
+        it->base + (
+                it->delta_signed ?
+                    zigzag_decode(bitpack_iter_next(&it->bp_iter))
+                    : (int64_t) bitpack_iter_next(&it->bp_iter))
+        : it->base;
     it->first = false;
 
     return it->base;
-}
-
-inline uint64_t zigzag_encode(int64_t value)
-{
-    return (value << 1) ^ (value >> (INT64_BITSIZE - 1));
-}
-
-inline int64_t zigzag_decode(uint64_t value)
-{
-    /*
-     * Operator '>>' on a signed integer replicates the highest bit,
-     * so (x << 63 >> 63) would return either bitmask consisting of all 0s
-     * or all 1s depending on the sign bit.
-     */
-    return ((int64_t) value << INT64_BITSIZE - 1 >> INT64_BITSIZE - 1) ^ (value >> 1);
 }
 
 #endif

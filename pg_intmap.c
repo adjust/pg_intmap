@@ -52,14 +52,17 @@ uint8_t *varint_encode(uint8_t *buf, uint64_t val);
 uint8_t *varint_decode(uint8_t *buf, uint64_t *out);
 uint8_t *bitpack_encode(uint8_t *buf, const uint64_t *vals, uint32_t nvals, uint8_t num_bits);
 uint8_t *bitpack_decode(uint8_t *buf, uint64_t *out, uint32_t nvals, uint8_t num_bits);
-uint8_t *delta_encode(uint8_t *buf, uint64_t *vals, uint32_t n, uint8_t delta_num_bits);
-uint8_t *delta_decode(uint8_t *buf, uint64_t *vals, uint32_t n, uint8_t delta_num_bits);
+uint8_t *delta_encode(uint8_t *buf, int64_t *vals, uint32_t n,
+                      uint8_t delta_num_bits, bool delta_signed);
+uint8_t *delta_decode(uint8_t *buf, int64_t *vals, uint32_t n,
+                      uint8_t delta_num_bits, bool delta_signed);
 uint64_t zigzag_encode(int64_t value);
 int64_t zigzag_decode(uint64_t value);
 void bitpack_iter_init(BitpackIter *it, uint8_t *buf, uint8_t num_bits);
 uint64_t bitpack_iter_next(BitpackIter *it);
 uint8_t *bitpack_iter_finish(BitpackIter *it);
-void delta_iter_init(DeltaIter *it, uint8_t *buf, uint8_t num_bits);
+void delta_iter_init(DeltaIter *it, uint8_t *buf, bool base_signed,
+                     uint8_t delta_num_bits, bool delta_signed);
 uint64_t delta_iter_next(DeltaIter *it);
 uint8_t *delta_iter_finish(DeltaIter *it);
 
@@ -135,7 +138,7 @@ static void collect_stats(ArrayStats *stats, int64_t *vals, uint32_t n)
     /* +1 byte for bits length encoding */
     stats->bitpack_size = BITPACK_SIZE(n, stats->num_bits) + 1;
 
-    uint32_t base_size = VARINT_SIZE(vals[0]);
+    uint32_t base_size = VARINT_SIZE(vals[0] < 0 ? zigzag_encode(vals[0]) : (uint64_t) vals[0]);
     stats->delta_size = BITPACK_SIZE(n - 1, stats->delta_num_bits) + 1 + base_size;
 
     stats->varint_size = varint_size;
@@ -157,6 +160,18 @@ static void collect_stats(ArrayStats *stats, int64_t *vals, uint32_t n)
             stats->best_size = results[i].size;
             stats->best_encoding = results[i].enc;
         }
+    }
+
+    /* Add zigzag encoding if needed */
+    switch (stats->best_encoding) {
+        case BITPACK_ENCODING:
+        case VARINT_ENCODING:
+            stats->best_encoding |= stats->is_signed ? ZIGZAG_ENCODING : 0;
+            break;
+        case DELTA_ENCODING:
+            /* only applies to the base */
+            stats->best_encoding |= vals[0] < 0 ? ZIGZAG_ENCODING : 0;
+            break;
     }
 }
 
@@ -254,7 +269,9 @@ static inline uint8_t *intmap_write_header(uint8_t *buf, IntMapHeader *h)
 static inline uint8_t *encode_array(uint8_t *buf, ArrayStats *stats,
                                     int64_t *vals, uint32_t n)
 {
-    switch (stats->best_encoding) {
+    Assert(n > 0);
+
+    switch (stats->best_encoding & 0x07) {
         case VARINT_ENCODING:
             for (uint32_t i = 0; i < n; ++i) {
                 uint64_t v;
@@ -271,8 +288,12 @@ static inline uint8_t *encode_array(uint8_t *buf, ArrayStats *stats,
             buf = bitpack_encode(buf, vals, n, stats->num_bits);
             break;
         case DELTA_ENCODING:
-            buf = write_num_bits(buf, stats->delta_num_bits);
-            buf = delta_encode(buf, vals, n, stats->delta_num_bits);
+            /*
+             * Write num_bits for deltas and set the most significat bit if
+             * deltas are signed
+             */
+            *buf++ = stats->delta_num_bits | (stats->is_delta_signed ? 0x80 : 0); 
+            buf = delta_encode(buf, vals, n, stats->delta_num_bits, stats->is_delta_signed);
             break;
         default:
             elog(ERROR, "unexpected encoding");
@@ -284,7 +305,7 @@ static inline uint8_t *encode_array(uint8_t *buf, ArrayStats *stats,
 static inline uint8_t *decode_array(uint8_t *buf, uint8_t encoding,
                                     int64_t *vals, uint32_t n)
 {
-    switch (encoding & 0x7)
+    switch (encoding & 0x07)
     {
         case VARINT_ENCODING:
             for (uint32_t i = 0; i < n; ++i) {
@@ -308,10 +329,12 @@ static inline uint8_t *decode_array(uint8_t *buf, uint8_t encoding,
             }
         case DELTA_ENCODING:
             {
+                bool    delta_signed;
                 uint8_t delta_num_bits;
 
-                buf = read_num_bits(buf, &delta_num_bits);
-                buf = delta_decode(buf, vals, n, delta_num_bits);
+                delta_signed = *buf & 0x80;
+                delta_num_bits = *buf++ & 0x7f;
+                buf = delta_decode(buf, vals, n, delta_num_bits, delta_signed);
                 break;
             }
         default:
@@ -323,7 +346,7 @@ static inline uint8_t *decode_array(uint8_t *buf, uint8_t encoding,
 
 typedef struct {
     uint8_t             encoding;
-    bool                zigzag;
+    bool                is_signed;
 
     union {
         /* varint */
@@ -342,7 +365,7 @@ typedef struct {
 static inline void decoder_iter_init(DecoderIter *it, uint8_t encoding, uint8_t *buf)
 {
     it->encoding = encoding & 0x7;
-    it->zigzag = encoding & 0x8;
+    it->is_signed = encoding & 0x8;
 
     switch (it->encoding)
     {
@@ -359,10 +382,13 @@ static inline void decoder_iter_init(DecoderIter *it, uint8_t encoding, uint8_t 
             }
         case DELTA_ENCODING:
             {
-                uint8_t     num_bits;
+                bool    delta_signed;
+                uint8_t delta_num_bits;
 
-                buf = read_num_bits(buf, &num_bits);
-                delta_iter_init(&it->u.delta, buf, num_bits);
+                delta_signed = *buf & 0x80;
+                delta_num_bits = *buf++ & 0x7f;
+                delta_iter_init(&it->u.delta, buf, it->is_signed,
+                                delta_num_bits, delta_signed);
                 break;
             }
         default:
@@ -378,9 +404,11 @@ static inline int64_t decoder_iter_next(DecoderIter *it)
     {
         case VARINT_ENCODING:
             it->u.varint.buf = varint_decode(it->u.varint.buf, &res);
+            res = it->is_signed ? zigzag_decode(res) : res;
             break;
         case BITPACK_ENCODING:
             res = bitpack_iter_next(&it->u.bitpack);
+            res = it->is_signed ? zigzag_decode(res) : res;
             break;
         case DELTA_ENCODING:
             res = delta_iter_next(&it->u.delta);
@@ -389,8 +417,6 @@ static inline int64_t decoder_iter_next(DecoderIter *it)
             elog(ERROR, "unsupported encoding");
     }
 
-    if (it->zigzag)
-        res = zigzag_decode(res);
 
     return res;
 }
@@ -476,8 +502,8 @@ static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n
     /* Write header */
     h.version = INTMAP_VERSION;
     h.nitems  = n;
-    h.key_enc = key_stats.best_encoding | (key_stats.is_signed ? ZIGZAG_ENCODING : 0);
-    h.val_enc = val_stats.best_encoding | (val_stats.is_signed ? ZIGZAG_ENCODING : 0);
+    h.key_enc = key_stats.best_encoding;
+    h.val_enc = val_stats.best_encoding;
     h.valoff = key_stats.best_size;
     keys_start = data = intmap_write_header(data, &h);
 
@@ -565,6 +591,7 @@ static inline const char *encoding_to_str(uint8_t encoding)
         case BITPACK_ENCODING | ZIGZAG_ENCODING:
             return "bit-pack (zig-zag)";
         case DELTA_ENCODING:
+        case DELTA_ENCODING | ZIGZAG_ENCODING:
             return "delta";
         default:
             elog(ERROR, "unexpected encoding");
