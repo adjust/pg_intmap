@@ -86,8 +86,11 @@ static void collect_stats(ArrayStats *stats, int64_t *vals, uint32_t n)
     uint64_t delta_mask = 0;
     int64_t  delta_base;
 
-    if (n == 0)
+    if (n == 0) {
+        stats->best_size = 0;
+        stats->best_encoding = PLAIN_ENCODING;
         return;
+    }
 
     /* delta encoding base */
     delta_base = vals[0];
@@ -204,6 +207,8 @@ static inline uint8_t *intmap_read_header(uint8_t *buf, IntMapHeader *h)
 
         /* read values offset */
         buf = varint_decode(buf, &h->valoff);
+    } else {
+        h->key_enc = h->val_enc = PLAIN_ENCODING;
     }
 
     return buf;
@@ -452,13 +457,21 @@ static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n
     ArrayStats key_stats, val_stats;
     uint8_t    *keys_start;
     IntMapHeader h;
-
-    /* TODO: estimate size */
-    out = palloc0(VARHDRSZ + 5 + sizeof(uint64_t) * n * 2);
-    data = VARDATA(out);
+    Size        sz;
 
     collect_stats(&key_stats, keys, n);
     collect_stats(&val_stats, values, n);
+
+    /*
+     * Estimate size:
+     * - 4 byte bytea header;
+     * - 3 bits version + 32 bits varint encoded length take up to 5 bytes;
+     * - 1 byte for encodings info;
+     * - estimated size of encoded keys and values.
+     */
+    sz = VARHDRSZ + 5 + 1 + key_stats.best_size + val_stats.best_size;
+    out = palloc0(sz);
+    data = VARDATA(out);
 
     /* Write header */
     h.version = INTMAP_VERSION;
@@ -468,11 +481,12 @@ static Datum create_intmap_internal(uint64_t *keys, uint64_t *values, uint32_t n
     h.valoff = key_stats.best_size;
     keys_start = data = intmap_write_header(data, &h);
 
+    /* Encode keys and values */
     if (n > 0) {
-        /* Encode keys and values */
         data = encode_array(data, &key_stats, keys, n);
         Assert(data == keys_start + key_stats.best_size);
         data = encode_array(data, &val_stats, values, n);
+        Assert(out + sz >= data);
     }
 
     SET_VARSIZE(out, data - out);
@@ -605,7 +619,7 @@ static Datum create_intarr_internal(uint64_t *values, uint32_t n)
      * - varint encoded number of items (max 5 bytes)
      * - calculated size of encoded data
      */
-    out = palloc0(MAXALIGN(VARHDRSZ + 1 + 5 + stats.best_size));
+    out = palloc0(VARHDRSZ + 1 + 5 + stats.best_size);
     data = VARDATA(out);
 
     /*

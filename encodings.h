@@ -76,15 +76,19 @@ inline uint8_t *bitpack_encode(uint8_t *buf, const uint64_t *vals, uint32_t nval
         i++;
     }
 
-    if (bits_used > 0)
-        memcpy(buf, (void *) &t, sizeof(uint64_t));
+    /* write the remainder */
+    if (bits_used > 0) {
+        /*
+         * Calculate the actual size of the remainder in bytes:
+         * (bits_used + sizeof(uint8_t) - 1) / sizeof(uint8_t)
+         */
+        uint8_t bytes_used = (bits_used + 7) >> 3;
 
-    /* 
-     * how many bytes used:
-     * (bits + sizeof(uint8_t) - 1) / sizeof(uint8_t)
-     */
-    uint8_t bytes_used = (bits_used + 7) >> 3;
-    return buf + bytes_used;
+        memcpy(buf, (void *) &t, bytes_used);
+        buf += bytes_used;
+    }
+
+    return buf;
 }
 
 inline uint8_t *bitpack_decode(uint8_t *buf, uint64_t *out, uint32_t nvals, uint8_t num_bits)
